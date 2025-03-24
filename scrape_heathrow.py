@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import pandas as pd
+import re
 
 # Base URL for Heathrow Boutique
 BASE_URL = "https://boutique.heathrow.com"
@@ -57,6 +58,7 @@ def scrape_category(category_name, category_info):
     Returns:
         list: A list of dictionaries containing product details
     """
+    print(f"----------------------------------------------------------------------------------------")
     print(f"Scraping category: {category_name} (CGID: {category_info['cgid']})")
 
     all_products = []
@@ -93,19 +95,46 @@ def scrape_category(category_name, category_info):
             product_image = img_tag["src"] if img_tag else "N/A"
 
             price_container = product.find("div", class_="price")
-            original_price_tag = price_container.find("span", class_="value-price") if price_container else None
-            original_price = original_price_tag["content"] if original_price_tag else "N/A"
-
             discounted_price_tag = price_container.find("span", class_="sales value mr-1") if price_container else None
             discounted_price = discounted_price_tag.text.strip() if discounted_price_tag else "N/A"
 
-
+            # Extract You Save Amount from Discount Info (e.g., "You save £29.40")
             discount_tag = price_container.find("span", class_="you-save") if price_container else None
             discount_text = discount_tag.text.strip() if discount_tag else "N/A"
+         
+            if discount_text != "N/A":
+                try:
+                    # Use a regular expression to match the number after "You save £"
+                    match = re.search(r"You save £([0-9,\.]+)", discount_text)
+                    
+                    if match:
+                        you_save = float(match.group(1).replace(",", ""))  # Remove commas and convert to float
+                    else:
+                        you_save = 0.0  # If the regex didn't find a match
+                
+                except ValueError:
+                    you_save = 0.0  # Invalid or missing value for You Save
+            else:
+                you_save = 0.0
+            # Calculate the original price if discounted price and you_save are available
+            if discounted_price != "N/A":
+                try:
+                    discounted_price_float = float(discounted_price.replace("£", "").replace(",", ""))  # Handle currency and commas
+                    original_price = discounted_price_float + you_save  # Original price = Discounted price + You save
+                except ValueError:
+                    original_price = "N/A"
+            elif discounted_price != "N/A" and discount_text == "N/A":
+                # If there's no discount info, consider the original price as the discounted price
+                original_price = discounted_price
+            else:
+                price_container = product.find("div", class_="price")
+                original_price_tag = price_container.find("span", class_="value-price") if price_container else None
+                original_price = original_price_tag["content"] if original_price_tag else "N/A"
 
             brand_tag = product.select_one("p.product-tile-brand")
             brand_name = brand_tag.text.strip() if brand_tag else "N/A"
-
+            original_price = f"£{float(original_price):.2f}"
+            # Add the calculated original price to the product data
             product_data = {
                 "Product Name": product_name,
                 "Product URL": product_url,
@@ -113,6 +142,7 @@ def scrape_category(category_name, category_info):
                 "Original Price": original_price,
                 "Discounted Price": discounted_price,
                 "Discount Info": discount_text,
+                "You Save Amount": f"£{you_save:.2f}" if you_save > 0 else "N/A",
                 "Brand Name": brand_name,
             }
 
@@ -121,6 +151,7 @@ def scrape_category(category_name, category_info):
             # Stop if the max limit is reached
             if len(all_products) >= MAX_PRODUCTS:
                 break
+
 
         # Move to the next set of products
         start += PAGE_SIZE
