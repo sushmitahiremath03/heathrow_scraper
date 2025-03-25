@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import time
 import pandas as pd
 import re
+from openpyxl import load_workbook
 
 # Base URL for Heathrow Boutique
 BASE_URL = "https://boutique.heathrow.com"
@@ -43,9 +44,30 @@ CATEGORIES = {
     },
 }
 
-# Define limits and pagination settings
-MAX_PRODUCTS = 200  # Limit products to avoid excessive scraping(if needed)
+# Define pagination settings
 PAGE_SIZE = 18  # Number of products per request
+MAX_RETRIES = 5  # Number of times to retry failed requests
+RETRY_DELAY = 2  # Initial delay in seconds (doubles each retry)
+
+#-----------------------------Optional------------------------------------
+# MAX_PRODUCTS = 200  Limit products to avoid excessive scraping(if needed)
+
+
+def fetch_with_retries(url, headers):
+    """Fetch a URL with retry logic."""
+    attempt = 0
+    while attempt < MAX_RETRIES:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response
+        else:
+            attempt += 1
+            wait_time = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+            print(f"Request failed (Attempt {attempt}/{MAX_RETRIES}). Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+    print(f"Failed to fetch data after {MAX_RETRIES} retries. Skipping URL: {url}")
+    return None
+
 
 def scrape_category(category_name, category_info):
     """
@@ -60,30 +82,27 @@ def scrape_category(category_name, category_info):
     """
     print(f"----------------------------------------------------------------------------------------")
     print(f"Scraping category: {category_name} (CGID: {category_info['cgid']})")
-
+    
     all_products = []
     start = 0  # Track pagination index
 
-    while len(all_products) < MAX_PRODUCTS:
-        # Construct paginated URL to fetch product listings dynamically
+    while True:
         paginated_url = f"{BASE_URL}/en/update-search?cgid={category_info['cgid']}&start={start}&sz={PAGE_SIZE}"
         print(f"Fetching page: {paginated_url}")
 
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(paginated_url, headers=headers)
+        response = fetch_with_retries(paginated_url, headers)
 
-        if response.status_code != 200:
-            print(f"Failed to fetch data for {category_name}. HTTP Status Code: {response.status_code}")
-            break  # Stop scraping this category if request fails
+        if response is None:  
+            break  # Stop scraping this category if request fails after retries
 
         soup = BeautifulSoup(response.text, "html.parser")
         products = soup.find_all("div", class_="product-tile")
 
         if not products:
             print("No more products found. Stopping pagination.")
-            break  # Stop if no products are available
+            break  
 
-        # Extract product details from each product tile
         for product in products:
             name_tag = product.find("div", class_="pdp-link")
             product_name = name_tag.text.strip() if name_tag else "N/A"
@@ -98,48 +117,33 @@ def scrape_category(category_name, category_info):
             discounted_price_tag = price_container.find("span", class_="sales value mr-1") if price_container else None
             discounted_price = discounted_price_tag.text.strip() if discounted_price_tag else "N/A"
 
-            # Extract You Save Amount from Discount Info (e.g., "You save £29.40")
             discount_tag = price_container.find("span", class_="you-save") if price_container else None
             discount_text = discount_tag.text.strip() if discount_tag else "N/A"
-         
+
+            you_save = 0.0
             if discount_text != "N/A":
-                try:
-                    # Use a regular expression to match the number after "You save £"
-                    match = re.search(r"You save £([0-9,\.]+)", discount_text)
-                    
-                    if match:
-                        you_save = float(match.group(1).replace(",", ""))  # Remove commas and convert to float
-                    else:
-                        you_save = 0.0  # If the regex didn't find a match
-                
-                except ValueError:
-                    you_save = 0.0  # Invalid or missing value for You Save
-            else:
-                you_save = 0.0
-            # Calculate the original price if discounted price and you_save are available
-            if discounted_price != "N/A":
-                try:
-                    discounted_price_float = float(discounted_price.replace("£", "").replace(",", ""))  # Handle currency and commas
-                    original_price = discounted_price_float + you_save  # Original price = Discounted price + You save
-                except ValueError:
-                    original_price = "N/A"
-            elif discounted_price != "N/A" and discount_text == "N/A":
-                # If there's no discount info, consider the original price as the discounted price
-                original_price = discounted_price
-            else:
-                price_container = product.find("div", class_="price")
-                original_price_tag = price_container.find("span", class_="value-price") if price_container else None
-                original_price = original_price_tag["content"] if original_price_tag else "N/A"
+                match = re.search(r"You save £([0-9,\.]+)", discount_text)
+                if match:
+                    you_save = float(match.group(1).replace(",", ""))
+
+            try:
+                if discounted_price != "N/A":
+                    discounted_price_float = float(discounted_price.replace("£", "").replace(",", ""))
+                    original_price = discounted_price_float + you_save
+                else:
+                    original_price_tag = price_container.find("span", class_="value-price") if price_container else None
+                    original_price = float(original_price_tag["content"]) if original_price_tag else "N/A"
+            except ValueError:
+                original_price = "N/A"
 
             brand_tag = product.select_one("p.product-tile-brand")
             brand_name = brand_tag.text.strip() if brand_tag else "N/A"
-            original_price = f"£{float(original_price):.2f}"
-            # Add the calculated original price to the product data
+
             product_data = {
                 "Product Name": product_name,
                 "Product URL": product_url,
                 "Product Image": product_image,
-                "Original Price": original_price,
+                "Original Price": f"£{original_price:.2f}" if isinstance(original_price, float) else "N/A",
                 "Discounted Price": discounted_price,
                 "Discount Info": discount_text,
                 "You Save Amount": f"£{you_save:.2f}" if you_save > 0 else "N/A",
@@ -148,42 +152,31 @@ def scrape_category(category_name, category_info):
 
             all_products.append(product_data)
 
-            # Stop if the max limit is reached
-            if len(all_products) >= MAX_PRODUCTS:
-                break
-
-
-        # Move to the next set of products
         start += PAGE_SIZE
-        time.sleep(1)  # Add delay to prevent overwhelming the server
+        time.sleep(1)
 
     return all_products
+
 
 print("Starting the scraping process...")
 
 all_data = {}
 
-# Scrape each category and store data in a dictionary
 for category_name, category_info in CATEGORIES.items():
     products = scrape_category(category_name, category_info)
     if products:
-        all_data[category_name] = pd.DataFrame(products)  # Convert to DataFrame
+        all_data[category_name] = pd.DataFrame(products)  
 
-# Save the data in an Excel file with separate sheets for each category
+# Save the data in an Excel file
 excel_filename = "scraped_products.xlsx"
 
 try:
-    # Append data to an existing Excel file if it exists
-    with pd.ExcelWriter(excel_filename, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
+    book = load_workbook(excel_filename)
+    with pd.ExcelWriter(excel_filename, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
         for category, df in all_data.items():
-            sheet_name = category.capitalize()[:31]  # Sheet names have a max length of 31 characters
-            existing_sheet = writer.sheets.get(sheet_name)  # Check if sheet exists
-
-            # Append data below existing rows
-            startrow = existing_sheet.max_row if existing_sheet else 0
-            df.to_excel(writer, sheet_name=sheet_name, index=False, header=False, startrow=startrow)
+            sheet_name = category.capitalize()[:31]
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
 except FileNotFoundError:
-    # Create a new file if it does not exist
     with pd.ExcelWriter(excel_filename, engine="openpyxl") as writer:
         for category, df in all_data.items():
             sheet_name = category.capitalize()[:31]
@@ -191,4 +184,3 @@ except FileNotFoundError:
 
 print(f"Scraped data saved to {excel_filename}")
 print(f"Total categories scraped: {len(all_data)}")
-
